@@ -11,14 +11,15 @@ from langchain_ollama import OllamaEmbeddings
 # ==============================================================================
 MODELO_GEMMA = "gemma:2b" 
 NOMBRE_COLECCION = "canciones_gemma_db"
+# Límite de seguridad: Procesamos máximo 100 canciones para que la demo sea rápida.
+# Si quieres procesar todo, cambia esto a 10000 o None (pero tardará horas).
+LIMITE_CANCIONES = 100 
 
 class SistemaRecomendacion:
     def __init__(self):
         print(f"\n🤖 Inicializando sistema con {MODELO_GEMMA}...")
-        self.directorio_actual = os.path.dirname(os.path.abspath(__file__))
-        
-        # Guardamos la DB en una carpeta local para que sea persistente
-        self.ruta_db = os.path.join(self.directorio_actual, "chroma_db")
+        self.dir_actual = os.path.dirname(os.path.abspath(__file__))
+        self.ruta_db = os.path.join(self.dir_actual, "chroma_db")
 
         try:
             self.embeddings = OllamaEmbeddings(model=MODELO_GEMMA)
@@ -29,101 +30,87 @@ class SistemaRecomendacion:
             )
             print("✅ Motor vectorial listo.")
         except Exception as e:
-            print(f"❌ Error al iniciar motor: {e}")
+            print(f"❌ Error crítico inicializando: {e}")
             sys.exit(1)
 
-    def encontrar_csv(self):
-        """Busca automáticamente cualquier archivo .csv en la carpeta actual"""
-        print("🔍 Buscando archivos CSV en la carpeta...")
-        archivos = glob.glob(os.path.join(self.directorio_actual, "*.csv"))
-        
-        if archivos:
-            archivo_encontrado = archivos[0]
-            print(f"📂 Archivo encontrado: {os.path.basename(archivo_encontrado)}")
-            return archivo_encontrado
-        else:
-            print("❌ No encontré ningún archivo .csv en esta carpeta.")
-            return None
-
-    def generar_dataset_emergencia(self):
-        """Crea un dataset pequeño si no encuentra el ZIP descomprimido"""
-        print("⚠️ Generando datos de prueba de emergencia...")
-        data = {
-            "artist": ["Coldplay", "Adele", "Survivor", "Queen"],
-            "title": ["Fix You", "Someone Like You", "Eye of the Tiger", "Don't Stop Me Now"],
-            "lyrics": [
-                "Lights will guide you home and ignite your bones",
-                "Never mind I'll find someone like you",
-                "It's the eye of the tiger it's the thrill of the fight",
-                "Tonight I'm gonna have myself a real good time"
-            ]
-        }
-        df = pd.DataFrame(data)
-        ruta = os.path.join(self.directorio_actual, "dataset_emergencia.csv")
-        df.to_csv(ruta, index=False)
-        return ruta
+    def encontrar_todos_los_csvs(self):
+        """Busca TODOS los archivos .csv en la carpeta actual"""
+        patron = os.path.join(self.dir_actual, "*.csv")
+        archivos = glob.glob(patron)
+        print(f"🔍 Buscando CSVs en: {self.dir_actual}")
+        print(f"📂 Archivos encontrados: {len(archivos)}")
+        return archivos
 
     def indexar_datos(self):
-        # 1. Buscar CSV real
-        ruta_csv = self.encontrar_csv()
+        csvs = self.encontrar_todos_los_csvs()
         
-        # 2. Si no hay, crear uno de emergencia para que puedas entregar
-        if not ruta_csv:
-            ruta_csv = self.generar_dataset_emergencia()
+        if not csvs:
+            print("❌ ERROR: No encontré ningún archivo .csv en esta carpeta.")
+            print("   Asegúrate de descomprimir el ZIP aquí mismo.")
+            return
 
-        try:
-            # Leemos el CSV
-            df = pd.read_csv(ruta_csv)
+        total_procesadas = 0
+        ids = []
+        docs = []
+        metas = []
+
+        print(f"⚡ Comenzando indexación masiva (Límite: {LIMITE_CANCIONES} canciones)...")
+        start_total = time.time()
+
+        for archivo in csvs:
+            if total_procesadas >= LIMITE_CANCIONES:
+                break
             
-            # Limpieza de nombres de columnas (por si vienen en mayúsculas o distinto)
-            df.columns = [c.lower().strip() for c in df.columns]
-            
-            # Intentamos adivinar las columnas correctas
-            col_titulo = next((c for c in df.columns if 'title' in c or 'song' in c or 'name' in c), None)
-            col_artista = next((c for c in df.columns if 'artist' in c), None)
-            col_letra = next((c for c in df.columns if 'lyric' in c or 'text' in c), None)
+            print(f"   📄 Leyendo: {os.path.basename(archivo)}...")
+            try:
+                # Leemos el CSV (manejando errores de formato comunes)
+                df = pd.read_csv(archivo, on_bad_lines='skip', encoding='utf-8', engine='python')
+                
+                # Normalizamos columnas
+                df.columns = [c.lower().strip() for c in df.columns]
+                
+                # Detectives de columnas: Buscamos variaciones de nombres
+                col_t = next((c for c in df.columns if c in ['title', 'song', 'track_name', 'name']), None)
+                col_a = next((c for c in df.columns if c in ['artist', 'singer', 'band', 'performer']), None)
+                col_l = next((c for c in df.columns if c in ['lyrics', 'text', 'lyric', 'content']), None)
 
-            if not (col_titulo and col_artista and col_letra):
-                print("❌ No pude identificar las columnas de Título, Artista o Letra en el CSV.")
-                print(f"Columnas encontradas: {df.columns}")
-                return
-
-            # IMPORTANTE: Tomamos solo las primeras 50 canciones para que sea rápido
-            # Procesar 50,000 canciones en local tardaría horas.
-            df_mini = df.head(50)
-            print(f"⚡ Procesando las primeras {len(df_mini)} canciones para la demostración...")
-            
-            ids = []
-            docs = []
-            metas = []
-
-            start = time.time()
-            print("⏳ Vectorizando con Gemma (esto puede tardar unos segundos)...")
-
-            for idx, row in df_mini.iterrows():
-                try:
-                    # Convertimos a string y limpiamos
-                    t = str(row[col_titulo])
-                    a = str(row[col_artista])
-                    l = str(row[col_letra])[:500] # Recortamos letras gigantes
-                    
-                    texto_vectorizar = f"Canción: {t}. Artista: {a}. Letra: {l}"
-                    
-                    ids.append(str(idx))
-                    docs.append(texto_vectorizar)
-                    metas.append({"titulo": t, "artista": a})
-                except:
+                # Si no encontramos las columnas, saltamos este archivo
+                if not (col_t and col_l):
+                    print(f"      ⚠️ Saltando {os.path.basename(archivo)} (No detecté columnas de Título/Letra)")
                     continue
-            
-            if docs:
-                vectores = self.embeddings.embed_documents(docs)
-                self.collection.add(ids=ids, embeddings=vectores, documents=docs, metadatas=metas)
-                print(f"✅ ¡Listo! Indexación terminada en {time.time() - start:.2f}s")
-            else:
-                print("⚠️ No se pudieron extraer datos válidos del CSV.")
 
-        except Exception as e:
-            print(f"❌ Error procesando el archivo: {e}")
+                # Procesamos filas
+                for _, row in df.iterrows():
+                    if total_procesadas >= LIMITE_CANCIONES:
+                        break
+                    
+                    try:
+                        tit = str(row[col_t])
+                        # Si no hay columna artista, ponemos "Desconocido"
+                        art = str(row[col_a]) if col_a else "Unknown Artist"
+                        let = str(row[col_l])[:1000] # Cortamos letras gigantes para velocidad
+                        
+                        # Solo procesamos si hay letra real
+                        if len(let) > 20: 
+                            texto_vector = f"Song: {tit}. Artist: {art}. Context: {let}"
+                            
+                            ids.append(f"song_{total_procesadas}")
+                            docs.append(texto_vector)
+                            metas.append({"titulo": tit, "artista": art})
+                            total_procesadas += 1
+                    except:
+                        continue
+
+            except Exception as e:
+                print(f"      ❌ Error leyendo archivo: {e}")
+
+        if docs:
+            print(f"⏳ Vectorizando {len(docs)} canciones con Gemma (paciencia)...")
+            vectores = self.embeddings.embed_documents(docs)
+            self.collection.add(ids=ids, embeddings=vectores, documents=docs, metadatas=metas)
+            print(f"✅ ¡Éxito! Indexación terminada en {time.time() - start_total:.2f}s")
+        else:
+            print("⚠️ No se pudieron extraer canciones válidas de los CSVs encontrados.")
 
     def buscar(self, consulta):
         print(f"\n🔎 Buscando: '{consulta}'...")
@@ -131,7 +118,9 @@ class SistemaRecomendacion:
             vector_query = self.embeddings.embed_query(consulta)
             resultados = self.collection.query(query_embeddings=[vector_query], n_results=3)
             
-            print("\n🎶 Recomendaciones:")
+            print("\n🎶 RECOMENDACIONES SEMÁNTICAS:")
+            print("="*40)
+            
             if not resultados['ids'] or not resultados['ids'][0]:
                 print("No se encontraron coincidencias.")
                 return
@@ -140,20 +129,23 @@ class SistemaRecomendacion:
                 titulo = resultados['metadatas'][0][i]['titulo']
                 artista = resultados['metadatas'][0][i]['artista']
                 score = 1 - resultados['distances'][0][i]
-                print(f"{i+1}. {titulo} - {artista} (Similitud: {score:.2f})")
+                print(f"{i+1}. {titulo}")
+                print(f"   👤 {artista}")
+                print(f"   📊 Similitud: {score:.4f}")
+                print("-" * 40)
         except Exception as e:
             print(f"❌ Error durante la búsqueda: {e}")
 
 if __name__ == "__main__":
     app = SistemaRecomendacion()
     
-    # Si la base de datos está vacía, buscamos CSV e indexamos
+    # Si la base de datos está vacía, buscamos CSVs e indexamos
     if app.collection.count() == 0:
         app.indexar_datos()
     else:
-        print("ℹ️  Base de datos vectorial cargada.")
+        print(f"ℹ️  Base de datos cargada ({app.collection.count()} canciones listas).")
 
     while True:
-        q = input("\n>> Escribe un sentimiento o situación (o 'salir'): ")
+        q = input("\n>> Describe una situación o sentimiento (o 'salir'): ")
         if q.lower() in ['salir', 'exit']: break
         if q.strip(): app.buscar(q)
